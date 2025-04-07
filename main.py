@@ -5,9 +5,13 @@ from tkinter import ttk, messagebox, PhotoImage
 from threading import Thread, Event
 import queue
 import time
+import logging
 import webbrowser
 from pynput import keyboard
 import pyautogui
+
+# Настройка логирования
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class ScaleApp:
     def __init__(self, root):
@@ -16,8 +20,7 @@ class ScaleApp:
 
         # Настройки по умолчанию
         self.decimal_point = ','  # Запятая как десятичный разделитель
-        self.decimal_places = 3  # Количество знаков после запятой
-        self.after_action = 'enter'  # Никаких действий после ввода
+        self.after_action = 'none'  # Никаких действий после ввода
         self.hotkey = 'F2'  # Горячая клавиша по умолчанию
 
         # Инициализация переменных
@@ -50,12 +53,6 @@ class ScaleApp:
     def set_decimal_point(self):
         """Устанавливает выбранный десятичный разделитель"""
         self.decimal_point = self.decimal_var.get()
-        if self.last_weight:
-            self.display_weight(self.last_weight)
-
-    def set_decimal_places(self):
-        """Устанавливает количество знаков после запятой"""
-        self.decimal_places = int(self.decimal_places_var.get())
         if self.last_weight:
             self.display_weight(self.last_weight)
 
@@ -95,12 +92,21 @@ class ScaleApp:
         """Вводит текущий вес в активное окно"""
         if self.last_weight:
             try:
-                weight_str = self.format_weight(self.last_weight)
+                # Берем значение "как есть" с весов, только меняем разделитель
+                if self.decimal_point == ',':
+                    weight_str = self.last_weight.replace('.', ',')
+                else:
+                    weight_str = self.last_weight
+
+                # Вставляем значение в активное окно
                 pyautogui.write(weight_str)
+
+                # Дополнительное действие если нужно
                 if self.after_action == 'tab':
                     pyautogui.press('tab')
                 elif self.after_action == 'enter':
                     pyautogui.press('enter')
+
                 self.show_status(f"Введено: {weight_str}" +
                                  (f", затем {self.after_action}" if self.after_action != 'none' else ""))
             except Exception as e:
@@ -109,10 +115,10 @@ class ScaleApp:
             self.show_status("Нет данных о весе", error=True)
 
     def format_weight(self, weight_str):
-        """Форматирует вес с учетом настроек десятичного разделителя и знаков"""
+        """Форматирует вес с учетом выбранного десятичного разделителя"""
         try:
             weight = float(weight_str)
-            formatted_weight = f"{weight:.{self.decimal_places}f}"
+            formatted_weight = f"{weight:.2f}"
             if self.decimal_point == ',':
                 formatted_weight = formatted_weight.replace('.', ',')
             return formatted_weight
@@ -153,6 +159,8 @@ class ScaleApp:
                 stopbits=serial.STOPBITS_ONE,
                 timeout=1
             )
+            self.serial_port.reset_input_buffer()  # Очищаем входной буфер
+            time.sleep(1)  # Добавляем задержку для инициализации устройства
             self.stop_event.clear()
             self.serial_thread = Thread(target=self.read_serial_data)
             self.serial_thread.daemon = True
@@ -179,16 +187,23 @@ class ScaleApp:
             try:
                 if self.serial_port.in_waiting > 0:
                     data = self.serial_port.read(self.serial_port.in_waiting)
+                    logging.debug(f"Получены данные: {data}")  # Логирование данных
                     buffer.extend(data)
+
+                    # Пока в буфере достаточно данных для формирования пакета
                     while len(buffer) >= 29:
+                        # Проверяем, что это корректный пакет (29 байт, заканчивается на \r\n)
                         if buffer[27] == 0x0D and buffer[28] == 0x0A:
                             packet = buffer[:29]
-                            buffer = buffer[29:]
-                            self.data_queue.put(packet)
+                            buffer = buffer[29:]  # Оставляем остаток буфера
+                            self.data_queue.put(packet)  # Отправляем пакет в очередь
                         else:
-                            break
-                time.sleep(0.1)
+                            # Если пакет некорректный, удаляем первый байт и пробуем снова
+                            buffer.pop(0)
+
+                time.sleep(0.1)  # Уменьшаем нагрузку на процессор
             except Exception as e:
+                logging.error(f"Ошибка чтения данных: {str(e)}")
                 self.data_queue.put(f"Ошибка: {str(e)}")
                 break
         self.data_queue.put(None)
@@ -215,23 +230,26 @@ class ScaleApp:
             weight_str = data[0:8].decode('ascii').strip()
             self.last_weight = weight_str
             self.display_weight(weight_str)
+
             # Единицы измерения (байты 9-11)
             units = data[8:11].decode('ascii').strip()
             self.last_units = units if units else None
             self.unit_var.set(units if units else "---")
-            # Статус (стабильный/нестабильный)
+
+            # Статус (стабильный/нестабильно)
             status = "Стабильно" if units else "Нестабильно"
             self.status_var.set(status)
-            # Сигнал ошибки при нестабильном статусе
-            if not units:
-                self.show_status("Нестабильное измерение! Проверьте весы.", error=True)
         except Exception as e:
             self.show_status(f"Ошибка обработки данных: {str(e)}", error=True)
 
     def display_weight(self, weight_str):
         """Отображает вес с учетом выбранного десятичного разделителя"""
-        formatted_weight = self.format_weight(weight_str)
-        self.weight_var.set(formatted_weight)
+        # Меняем только разделитель, если он отличается от исходного
+        if self.decimal_point == ',':
+            displayed_weight = weight_str.replace('.', ',')
+        else:
+            displayed_weight = weight_str
+        self.weight_var.set(displayed_weight)
 
     def show_status(self, message, error=False):
         """Отображает сообщение в статусной строке"""
@@ -269,15 +287,9 @@ class ScaleApp:
                         command=self.set_decimal_point).grid(row=0, column=1, padx=5, pady=2)
         ttk.Radiobutton(format_frame, text="Точка (.)", variable=self.decimal_var, value=".",
                         command=self.set_decimal_point).grid(row=0, column=2, padx=5, pady=2)
-        # Выбор количества знаков после запятой
-        ttk.Label(format_frame, text="Знаков после запятой:").grid(row=1, column=0, padx=5, pady=2)
-        self.decimal_places_var = tk.StringVar(value="3")
-        ttk.Combobox(format_frame, textvariable=self.decimal_places_var, values=["0", "1", "2", "3"],
-                     state="readonly", width=5).grid(row=1, column=1, padx=5, pady=2)
-        ttk.Button(format_frame, text="Применить", command=self.set_decimal_places).grid(row=1, column=2, padx=5, pady=2)
         # Выбор действия после ввода
         ttk.Label(format_frame, text="После ввода:").grid(row=0, column=3, padx=5, pady=2)
-        self.action_var = tk.StringVar(value="enter")  # Enter по умолчанию
+        self.action_var = tk.StringVar(value="none")
         ttk.Radiobutton(format_frame, text="Ничего", variable=self.action_var, value="none",
                         command=self.set_after_action).grid(row=0, column=4, padx=5, pady=2)
         ttk.Radiobutton(format_frame, text="Enter", variable=self.action_var, value="enter",
@@ -323,7 +335,7 @@ class ScaleApp:
         github_btn = ttk.Button(
             footer_frame,
             image=self.github_icon,
-            #text=" GitHub" if self.github_icon else "GitHub",
+            text=" GitHub" if self.github_icon else "GitHub",
             compound="left" if self.github_icon else None,
             command=lambda: webbrowser.open("https://github.com/Hasan175"),
             style='Toolbutton'
